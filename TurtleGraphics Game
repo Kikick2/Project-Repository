@@ -1,0 +1,35 @@
+import random
+import turtle
+
+screen = turtle.Screen()
+screen.setup(600, 400)
+screen.title("거북이 클릭 게임")
+
+player = turtle.Turtle()
+player.shape("turtle")
+player.color("green")
+player.shapesize(2)
+player.penup()       # 이동할 때 선을 그리지 않음
+player.speed(0)      # 새 위치로 즉시 이동
+
+score = 0
+target_score = 5
+
+
+def catch_turtle(x, y):
+    global score
+    score += 1
+
+    if score == target_score:
+        player.hideturtle()
+        player.goto(0, 0)
+        player.write("5점 달성! 게임 성공!", align="center",
+                     font=("Arial", 18, "bold"))
+        screen.title("게임 종료")
+    else:
+        screen.title(f"거북이 클릭 게임 | 점수 {score} / {target_score}")
+        player.goto(random.randint(-240, 240), random.randint(-140, 140))
+
+
+player.onclick(catch_turtle)
+screen.mainloop()
