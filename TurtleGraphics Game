@@ -1,35 +1,457 @@
+"""거북이 할리갈리 | Python 표준 라이브러리만 사용합니다."""
+import argparse
+import json
+import re
+import uuid
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.request import Request, urlopen
+import math
 import random
+import sqlite3
+import time
 import turtle
+from collections import Counter
+from pathlib import Path
+from tkinter import messagebox, simpledialog
 
-screen = turtle.Screen()
-screen.setup(600, 400)
-screen.title("거북이 클릭 게임")
+COLORS = [("빨강", "#c94f50"), ("노랑", "#dfab26"), ("초록", "#289173"),
+          ("파랑", "#4884c1")]
+# 남, 서, 북, 동. 카드 중심 좌표이며 각 카드는 132 x 96입니다.
+SEATS = [("남", 0, -119), ("서", -178, 0), ("북", 0, 119), ("동", 178, 0)]
+PIPS = {
+    1: [(0, 0)],
+    2: [(-24, 0), (24, 0)],
+    3: [(-32, 0), (0, 0), (32, 0)],
+    4: [(-30, 13), (30, 13), (-30, -13), (30, -13)],
+    5: [(-37, 14), (37, 14), (0, 0), (-37, -14), (37, -14)],
+}
+DB = Path.home() / "TurtleHalliGalli" / "scores.sqlite3"
+BG, INK, TEAL = "#eaf4ef", "#183d37", "#156e61"
 
-player = turtle.Turtle()
-player.shape("turtle")
-player.color("green")
-player.shapesize(2)
-player.penup()       # 이동할 때 선을 그리지 않음
-player.speed(0)      # 새 위치로 즉시 이동
 
-score = 0
-target_score = 5
+class Round:
+    def __init__(self, now):
+        self.cards = [None] * 4
+        self.last_open = None
+        self.next_seat = 0
+        self.next_deal = now + 2
+        self.deadline = now + 60
+        self.score = 0
+
+    def deal(self, now):
+        self.last_open = now
+        self.cards[self.next_seat] = (random.randrange(len(COLORS)), random.randint(1, 5))
+        self.next_seat = (self.next_seat + 1) % 4
+        self.next_deal = now + 2
+
+    def ring(self, now):
+        totals = Counter()
+        for card in self.cards:
+            if card is not None:
+                color, count = card
+                totals[color] += count
+        matches = [COLORS[color][0] for color, count in totals.items() if count == 5]
+        if matches:
+            elapsed = now - self.last_open
+            if elapsed <= 0.5:
+                grade, points = "PERFECT", 5
+            elif elapsed <= 1:
+                grade, points = "GREAT", 3
+            elif elapsed <= 2:
+                grade, points = "GOOD", 1
+            else:
+                return "다음 카드를 기다리세요.", ""
+            self.score += points
+            self.deadline += 10
+            self.cards = [None] * 4  # 정답 판의 카드를 회수해 중복 득점을 방지
+            return f"{', '.join(matches)} 5마리!   +{points}점   +10초", grade
+        self.deadline -= 3
+        return "오답!   −3초", "BAD"
 
 
-def catch_turtle(x, y):
-    global score
-    score += 1
+# 인터넷 배포 시 운영자가 공유 HTTPS 서버 주소를 한 번 지정합니다.
+PUBLIC_RANKING_URL = ""
+DISCOVERY_PORT = 18765
+DISCOVERY_QUERY = b"TURTLE-HALLI:RANKING:1?"
+DISCOVERY_PREFIX = b"TURTLE-HALLI:RANKING:1 "
 
-    if score == target_score:
-        player.hideturtle()
-        player.goto(0, 0)
-        player.write("5점 달성! 게임 성공!", align="center",
-                     font=("Arial", 18, "bold"))
-        screen.title("게임 종료")
+
+def announce_server(http_port):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.bind(("", DISCOVERY_PORT))
+        while True:
+            packet, client = sock.recvfrom(256)
+            if packet == DISCOVERY_QUERY:
+                sock.sendto(DISCOVERY_PREFIX + str(http_port).encode("ascii"), client)
+
+
+def find_lan_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for _ in range(2):
+            for host in ("127.0.0.1", "255.255.255.255"):
+                try:
+                    sock.sendto(DISCOVERY_QUERY, (host, DISCOVERY_PORT))
+                except OSError:
+                    continue
+            deadline = time.monotonic() + 0.6
+            while time.monotonic() < deadline:
+                sock.settimeout(max(0.001, deadline - time.monotonic()))
+                try:
+                    data, address = sock.recvfrom(256)
+                except socket.timeout:
+                    break
+                if data.startswith(DISCOVERY_PREFIX):
+                    port = data[len(DISCOVERY_PREFIX):]
+                    if port.isdigit() and 0 < int(port) <= 65535:
+                        return f"http://{address[0]}:{int(port)}"
+    raise ConnectionError("같은 네트워크에서 실행 중인 랭킹 서버를 찾지 못했습니다.")
+
+
+SERVER_FILE = DB.with_name("ranking_server.txt")
+SHARED_DB = DB.with_name("shared_scores.sqlite3")
+
+
+def leaderboard_server(port, path=SHARED_DB):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS entries "
+                   "(game TEXT UNIQUE, initials TEXT NOT NULL, score INTEGER NOT NULL)")
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, status, data):
+            body = json.dumps(data).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path != "/scores":
+                return self.reply(404, {})
+            with sqlite3.connect(path) as db:
+                rows = db.execute("SELECT initials,score FROM entries "
+                                  "ORDER BY score DESC,rowid LIMIT 20").fetchall()
+            self.reply(200, {"ranking": rows})
+
+        def do_POST(self):
+            if self.path != "/scores":
+                return self.reply(404, {})
+            try:
+                size = int(self.headers.get("Content-Length", "0"))
+                if not 0 < size <= 1024:
+                    raise ValueError
+                data = json.loads(self.rfile.read(size))
+                game = str(uuid.UUID(data["game"]))
+                name, points = data["initials"], data["score"]
+                if not isinstance(name, str) or not re.fullmatch("[A-Z]{5}", name):
+                    raise ValueError
+                if type(points) is not int or not 0 <= points <= 2147483647:
+                    raise ValueError
+            except (ValueError, KeyError, TypeError, AttributeError):
+                return self.reply(400, {})
+            with sqlite3.connect(path) as db:
+                db.execute("INSERT OR IGNORE INTO entries VALUES(?,?,?)", (game, name, points))
+            self.reply(200, {"saved": True})
+
+    return ThreadingHTTPServer(("", port), Handler)
+
+
+def request_scores(url, payload=None):
+    body = None if payload is None else json.dumps(payload).encode()
+    req = Request(url.rstrip("/") + "/scores", data=body,
+                  headers={"Content-Type": "application/json"})
+    with urlopen(req, timeout=3) as response:
+        return json.load(response)
+
+
+def sync_scores(url):
+    DB.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS pending (game TEXT PRIMARY KEY, initials TEXT, score INTEGER)")
+        for game, name, score in db.execute("SELECT * FROM pending").fetchall():
+            reply = request_scores(url, {"game": game, "initials": name, "score": score})
+            if reply.get("saved") is not True:
+                raise ValueError("등록 확인 실패")
+            db.execute("DELETE FROM pending WHERE game=?", (game,))
+        return request_scores(url)["ranking"]
+
+
+def save_score(initials, score, path=DB):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS scores "
+                   "(id INTEGER PRIMARY KEY, initials TEXT, score INTEGER, played TEXT)")
+        db.execute("INSERT INTO scores(initials,score,played) "
+                   "VALUES(?,?,datetime('now','localtime'))", (initials, score))
+        db.execute("CREATE TABLE IF NOT EXISTS pending (game TEXT PRIMARY KEY, initials TEXT, score INTEGER)")
+        db.execute("INSERT INTO pending VALUES(?,?,?)", (str(uuid.uuid4()), initials, score))
+        return db.execute("SELECT initials,score FROM scores "
+                          "ORDER BY score DESC,id ASC LIMIT 5").fetchall()
+
+
+class Game:
+    def __init__(self):
+        self.screen = turtle.Screen()
+        self.screen.setup(600, 570)
+        self.screen.title("거북이 할리갈리")
+        self.screen.bgcolor(BG)
+        self.screen.tracer(0)
+        self.board = self.pen()
+        self.status = self.pen()
+        self.feedback = self.pen()
+        self.feedback_id = 0
+        self.server_url = SERVER_FILE.read_text().strip() if SERVER_FILE.exists() else ""
+        self.mode = "ready"
+        self.draw_board()
+        self.caption(0, 223, "거북이 할리갈리", 22)
+        self.caption(0, -219, "같은 색이 정확히 5마리일 때 중앙 종을 누르세요.", 12)
+        self.caption(0, -244, "제한 시간 60초   ·   정답 +10초   ·   오답 −3초", 10)
+        self.screen.onclick(self.click)
+        self.screen.update()
+
+    @staticmethod
+    def pen():
+        p = turtle.Turtle(visible=False)
+        p.penup()
+        p.speed(0)
+        return p
+
+    def caption(self, x, y, text, size, color=INK, pen=None):
+        p = self.status if pen is None else pen
+        p.goto(x, y)
+        p.color(color)
+        p.write(text, align="center", font=("Malgun Gothic", size, "bold"))
+
+    def draw_board(self):
+        p = self.board
+        p.clear()
+        p.shape("turtle")
+        p.shapesize(0.95)
+        for i, (direction, x, y) in enumerate(SEATS):
+            if self.mode in ("ready", "end") and direction == "남":
+                continue  # 시작 화면에서는 남쪽 카드 자리에 설명 버튼을 표시
+            card = self.round.cards[i] if self.mode == "play" else None
+            p.goto(x - 66, y - 48)
+            p.color("#a9c5b9", "#fffdf7" if card else "#d9e9e0")
+            p.pendown()
+            p.begin_fill()
+            for dx, dy in [(66, -48), (66, 48), (-66, 48), (-66, -48)]:
+                p.goto(x + dx, y + dy)
+            p.end_fill()
+            p.penup()
+            if card is None:
+                self.caption(x, y - 10, direction, 15, TEAL, p)
+            else:
+                color, count = card
+                name, fill = COLORS[color]
+                self.caption(x, y + 23, f"{direction} · {name}", 9, INK, p)
+                for dx, dy in PIPS[count]:
+                    p.goto(x + dx, y - 8 + dy)
+                    p.color(INK, fill)
+                    p.stamp()
+        p.goto(0, 0)
+        p.dot(96, TEAL)
+        label = {"ready": "시작", "play": "종", "end": "다시 시작"}[self.mode]
+        self.caption(0, -12, label, 15, "white", p)
+
+        if self.mode in ("ready", "end"):
+            for left, right, title in [(-152, -8, "게임 설명"), (8, 160, "RANKING")]:
+                p.goto(left, -114)
+                p.color(TEAL, "#fffdf7")
+                p.pendown()
+                p.begin_fill()
+                for corner in [(right, -114), (right, -74), (left, -74), (left, -114)]:
+                    p.goto(*corner)
+                p.end_fill()
+                p.penup()
+                self.caption((left + right) / 2 + (16 if left > 0 else 0),
+                             -105, title, 12, TEAL, p)
+            # 왕관을 직접 그려 Windows의 이모지 글꼴과 무관하게 표시한다.
+            p.goto(33, -99)
+            p.color(INK, "#48a783")
+            p.stamp()
+            p.goto(25, -91)
+            p.color("#94651b", "#ffcc44")
+            p.pendown()
+            p.begin_fill()
+            for corner in [(23,-83),(29,-87),(33,-80),(37,-87),(43,-83),(41,-91),(25,-91)]:
+                p.goto(*corner)
+            p.end_fill()
+            p.penup()
+
+    def online_ranking(self):
+        if PUBLIC_RANKING_URL:
+            return sync_scores(PUBLIC_RANKING_URL)
+        if self.server_url:
+            try:
+                return sync_scores(self.server_url)
+            except (OSError, ValueError, KeyError):
+                self.server_url = ""
+        url = find_lan_server()
+        rows = sync_scores(url)
+        self.server_url = url
+        SERVER_FILE.write_text(url)
+        return rows
+
+    def show_ranking(self):
+        parent = self.screen.getcanvas().winfo_toplevel()
+        try:
+            rows = self.online_ranking()
+        except (OSError, ValueError, KeyError, sqlite3.Error):
+            messagebox.showinfo("RANKING · 전체 플레이 기록 TOP 20",
+                                "서버에 연결할 수 없습니다. 잠시 후 다시 눌러 주세요.", parent=parent)
+            return
+        lines = [f"{i:2}위    {name}    {points}점" for i, (name, points) in enumerate(rows, 1)]
+        messagebox.showinfo("RANKING · 전체 플레이 기록 TOP 20",
+                            "\n".join(lines) or "첫 기록을 기다리고 있습니다.", parent=parent)
+
+    def show_rules(self):
+        messagebox.showinfo(
+            "거북이 할리갈리 · 게임 설명",
+            "제한시간 1분동안 같은 색 거북이 5마리를 최대한 빨리 많이 찾으세요.\n\n"
+            "카드는 2초마다 남 → 서 → 북 → 동 순서로 한 장씩 열립니다. "
+            "현재 보이는 카드에서 같은색의 거북이 합이 5마리이면 종을 누르세요.\n"
+            "예: 빨강 거북이 2마리 카드와 빨강 거북이 3마리카드면 정답입니다.\n\n"
+            "직전 카드가 오픈된 후 종을 누르기까지의 시간\n"
+            "0.5초 이하    PERFECT · 5점\n"
+            "0.5초 초과 ~ 1초 이하    GREAT · 3점\n"
+            "1초 초과 ~ 2초 이하    GOOD · 1점\n\n"
+            "정답이면 제한시간이 10초 증가하고 오픈된 카드가 리셋됩니다. "
+            "오답이면 BAD가 표시되고 제한시간이 3초 감소됩니다.\n"
+            "제한시간이 끝나면 이니셜 3자로 점수를 기록할 수 있습니다.\n"
+            "1등 : 편의점 5천원 상품권"
+            "2등 : 스타벅스 아메리카노 1잔"
+            "3등 : 모모커피 아메리카노 1잔",
+            parent=self.screen.getcanvas().winfo_toplevel(),
+        )
+
+    def start(self):
+        self.round = Round(time.monotonic())
+        self.mode = "play"
+        self.note = "2초마다 남 → 서 → 북 → 동 순서로 한 장씩 공개됩니다."
+        self.last_status = None
+        self.draw_board()
+        self.tick()
+
+    def refresh(self, now):
+        state = (max(0, math.ceil(self.round.deadline - now)), self.round.score, self.note)
+        if self.last_status != state:
+            seconds, points, note = state
+            self.status.clear()
+            self.caption(0, 212, f"남은 시간  {seconds}초      점수  {points}", 18)
+            self.caption(0, -225, note, 11)
+            self.last_status = state
+        self.screen.update()
+
+    def tick(self):
+        if self.mode != "play":
+            return
+        now = time.monotonic()
+        if now >= self.round.deadline:
+            self.finish()
+            return
+        if now >= self.round.next_deal:
+            self.round.deal(now)
+            self.note = "같은 색의 거북이 합이 5마리이면 종을 누르세요."
+            self.draw_board()
+        self.refresh(now)
+        # 이전 판의 예약 콜백이 새 판의 타이머와 겹치지 않도록 판을 확인
+        current = self.round
+        self.screen.ontimer(lambda: self.tick() if self.round is current else None, 80)
+
+    def click(self, x, y):
+        if self.mode in ("ready", "end") and -114 <= y <= -74:
+            if -152 <= x <= -8:
+                self.show_rules()
+            elif 8 <= x <= 160:
+                self.show_ranking()
+            return
+        if x*x + y*y > 48**2:
+            return
+        if self.mode in ("ready", "end"):
+            self.start()
+        elif self.mode == "play":
+            now = time.monotonic()
+            if now >= self.round.deadline:
+                self.finish()
+                return
+            self.note, grade = self.round.ring(now)
+            if grade:
+                self.feedback.clear()
+                self.caption(0, -201, grade, 16, "#b33b38" if grade == "BAD" else TEAL, self.feedback)
+                self.feedback_id += 1
+                current = self.feedback_id
+                self.screen.ontimer(lambda: self.hide_grade(current), 1000)
+            if now >= self.round.deadline:
+                self.mode = "ending"
+                self.refresh(now)
+                self.screen.ontimer(self.finish, 1000)
+            else:
+                self.draw_board()
+                self.refresh(now)
+
+    def hide_grade(self, current):
+        if current != self.feedback_id:
+            return
+        self.feedback.clear()
+        self.screen.update()
+
+    def finish(self):
+        self.mode = "saving"
+        self.feedback.clear()
+        self.status.clear()
+        points = self.round.score
+        self.caption(0, 215, f"시간 종료   ·   최종 {points}점", 19)
+        self.screen.update()
+        parent = self.screen.getcanvas().winfo_toplevel()
+        prompt = "기록에 사용할 영문 이니셜 3자를 입력하세요."
+        result = "저장을 취소했습니다."
+        ranking = []
+        while True:
+            value = simpledialog.askstring("점수 기록", prompt, parent=parent)
+            if value is None:
+                break
+            value = value.strip()
+            if len(value) != 3 or not value.isascii() or not value.isalpha():
+                prompt = "이니셜 영문자 3자를 입력하세요. 예: YHL"
+                continue
+            try:
+                ranking = save_score(value.upper(), points)
+            except (OSError, sqlite3.Error) as error:
+                messagebox.showerror("점수 저장 실패", str(error), parent=parent)
+                prompt = "저장하려면 이니셜을 입력하세요."
+                continue
+            result = f"{value.upper()}  {points}점 · PC 저장 (랭킹 등록 대기)"
+            try:
+                ranking = self.online_ranking()[:5]
+                result = f"{value.upper()}  {points}점 · 랭킹 등록 완료"
+            except (OSError, ValueError, KeyError, sqlite3.Error):
+                pass
+            break
+        self.mode = "end"
+        self.draw_board()
+        self.caption(0, 183, result, 12)
+        for i, (name, score) in enumerate(ranking):
+            self.caption((i - (len(ranking)-1)/2)*103, -219,
+                         f"{i+1}. {name}", 10)
+            self.caption((i - (len(ranking)-1)/2)*103, -241, f"{score}점", 10)
+        self.screen.update()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--server", action="store_true")
+    parser.add_argument("--port", type=int, default=8765)
+    args = parser.parse_args()
+    if args.server:
+        with leaderboard_server(args.port) as server:
+            print(f"랭킹 서버 실행 중 (포트 {args.port}). 종료: Ctrl+C", flush=True)
+            threading.Thread(target=announce_server, args=(server.server_port,), daemon=True).start()
+            server.serve_forever()
     else:
-        screen.title(f"거북이 클릭 게임 | 점수 {score} / {target_score}")
-        player.goto(random.randint(-240, 240), random.randint(-140, 140))
-
-
-player.onclick(catch_turtle)
-screen.mainloop()
+        Game()
+        turtle.mainloop()
